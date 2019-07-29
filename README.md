@@ -1,4 +1,4 @@
-This repo includes new sample, which prevents any notepad process from being killed by other processes. 
+This repo includes modified version of kinfinityhook driver, which prevents any notepad process from being killed by other processes. 
 
 See our blog post to see the details in how to build this project and what part of infinityhook is modified:
   
