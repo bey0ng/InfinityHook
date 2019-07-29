@@ -18,158 +18,83 @@
 #include "entry.h"
 #include "infinityhook.h"
 
-static wchar_t IfhMagicFileName[] = L"ifh--";
+typedef NTSTATUS (NTAPI *NtTerminateProcess_t)(IN HANDLE ProcessHandle, IN NTSTATUS ExitStatus);
+static NtTerminateProcess_t OrigNtTerminateProcess = NULL;
+NTSTATUS DetourNtTerminateProcess(IN HANDLE ProcessHandle, IN NTSTATUS ExitStatus);
 
-static UNICODE_STRING StringNtCreateFile = RTL_CONSTANT_STRING(L"NtCreateFile");
-static NtCreateFile_t OriginalNtCreateFile = NULL;
+typedef PCHAR (*PsGetProcessImageFileName_t)(IN PEPROCESS);
+static PsGetProcessImageFileName_t PsGetProcessImageFileName = NULL;
 
-/*
-*	The entry point of the driver. Initializes infinity hook and
-*	sets up the driver's unload routine so that it can be gracefully 
-*	turned off.
-*/
-extern "C" NTSTATUS DriverEntry(
-	_In_ PDRIVER_OBJECT DriverObject, 
-	_In_ PUNICODE_STRING RegistryPath)
+// 드라이버 메인
+extern "C" 
+NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
-	UNREFERENCED_PARAMETER(RegistryPath);
+    UNREFERENCED_PARAMETER(RegistryPath);
 
-	//
-	// Figure out when we built this last for debugging purposes.
-	//
-	kprintf("[+] infinityhook: Loaded.\n");
-	
-	//
-	// Let the driver be unloaded gracefully. This also turns off 
-	// infinity hook.
-	//
-	DriverObject->DriverUnload = DriverUnload;
+    kprintf("[+] infinityhook: Loaded.\n");
 
-	//
-	// Demo detouring of nt!NtCreateFile.
-	//
-	OriginalNtCreateFile = (NtCreateFile_t)MmGetSystemRoutineAddress(&StringNtCreateFile);
-	if (!OriginalNtCreateFile)
-	{
-		kprintf("[-] infinityhook: Failed to locate export: %wZ.\n", StringNtCreateFile);
-		return STATUS_ENTRYPOINT_NOT_FOUND;
-	}
+    // 드라이버 언로드 핸들러 등록
+    DriverObject->DriverUnload = DriverUnload;
 
-	//
-	// Initialize infinity hook. Each system call will be redirected
-	// to our syscall stub.
-	//
-	NTSTATUS Status = IfhInitialize(SyscallStub);
-	if (!NT_SUCCESS(Status))
-	{
-		kprintf("[-] infinityhook: Failed to initialize with status: 0x%lx.\n", Status);
-	}
+    // 후킹 시작(시스템콜이 발생하면, SyscallStub 함수로 제어권이 넘어감)
+    NTSTATUS Status = IfhInitialize(SyscallStub);
+    if (!NT_SUCCESS(Status)) kprintf("[-] infinityhook: Failed to initialize with status: 0x%lx.\n", Status);
 
-	return Status;
+    return Status;
 }
 
-/*
-*	Turns off infinity hook.
-*/
-void DriverUnload(
-	_In_ PDRIVER_OBJECT DriverObject)
-{
-	UNREFERENCED_PARAMETER(DriverObject);
+// 드라이버 언로드할 때
+void DriverUnload(_In_ PDRIVER_OBJECT DriverObject) {
+    UNREFERENCED_PARAMETER(DriverObject);
 
-	//
-	// Unload infinity hook gracefully.
-	//
-	IfhRelease();
+    // 후킹 종료
+    IfhRelease();
 
-	kprintf("\n[!] infinityhook: Unloading... BYE!\n");
+    kprintf("\n[!] infinityhook: Unloading... BYE!\n");
 }
 
-/*
-*	For each usermode syscall, this stub will be invoked.
-*/
-void __fastcall SyscallStub(
-	_In_ unsigned int SystemCallIndex, 
-	_Inout_ void** SystemCallFunction)
-{
-	// 
-	// Enabling this message gives you VERY verbose logging... and slows
-	// down the system. Use it only for debugging.
-	//
-	
-#if 0
-	kprintf("[+] infinityhook: SYSCALL %lu: 0x%p [stack: 0x%p].\n", SystemCallIndex, *SystemCallFunction, SystemCallFunction);
-#endif
+void __fastcall SyscallStub(_In_ unsigned int SystemCallIndex, _Inout_ void** SystemCallFunction) {
+    if (SystemCallIndex == 0x2c/*NtTerminateProcess 인덱스*/) {
+        // 원본 NtTerminateProcess 주소를 백업
+        if (OrigNtTerminateProcess == NULL)
+            OrigNtTerminateProcess = (NtTerminateProcess_t)*SystemCallFunction;
 
-	UNREFERENCED_PARAMETER(SystemCallIndex);
-
-	//
-	// In our demo, we care only about nt!NtCreateFile calls.
-	//
-	if (*SystemCallFunction == OriginalNtCreateFile)
-	{
-		//
-		// We can overwrite the return address on the stack to our detoured
-		// NtCreateFile.
-		//
-		*SystemCallFunction = DetourNtCreateFile;
-	}
+        // NtTerminateProcess 함수 콜을 후킹 함수(DetourNtTerminateProcess)로 바꿔준다.
+        *SystemCallFunction = DetourNtTerminateProcess; 
+    }
 }
 
-/*
-*	This function is invoked instead of nt!NtCreateFile. It will 
-*	attempt to filter a file by the "magic" file name.
-*/
-NTSTATUS DetourNtCreateFile(
-	_Out_ PHANDLE FileHandle,
-	_In_ ACCESS_MASK DesiredAccess,
-	_In_ POBJECT_ATTRIBUTES ObjectAttributes,
-	_Out_ PIO_STATUS_BLOCK IoStatusBlock,
-	_In_opt_ PLARGE_INTEGER AllocationSize,
-	_In_ ULONG FileAttributes,
-	_In_ ULONG ShareAccess,
-	_In_ ULONG CreateDisposition,
-	_In_ ULONG CreateOptions,
-	_In_reads_bytes_opt_(EaLength) PVOID EaBuffer,
-	_In_ ULONG EaLength)
-{
-	//
-	// We're going to filter for our "magic" file name.
-	//
-	if (ObjectAttributes &&
-		ObjectAttributes->ObjectName && 
-		ObjectAttributes->ObjectName->Buffer)
-	{
-		//
-		// Unicode strings aren't guaranteed to be NULL terminated so
-		// we allocate a copy that is.
-		//
-		PWCHAR ObjectName = (PWCHAR)ExAllocatePool(NonPagedPool, ObjectAttributes->ObjectName->Length + sizeof(wchar_t));
-		if (ObjectName)
-		{
-			memset(ObjectName, 0, ObjectAttributes->ObjectName->Length + sizeof(wchar_t));
-			memcpy(ObjectName, ObjectAttributes->ObjectName->Buffer, ObjectAttributes->ObjectName->Length);
-		
-			//
-			// Does it contain our special file name?
-			//
-			if (wcsstr(ObjectName, IfhMagicFileName))
-			{
-				kprintf("[+] infinityhook: Denying access to file: %wZ.\n", ObjectAttributes->ObjectName);
+// NtTerminateProcess 후킹 함수
+NTSTATUS DetourNtTerminateProcess(IN HANDLE ProcessHandle, IN NTSTATUS ExitStatus) {
 
-				ExFreePool(ObjectName);
+    NTSTATUS  rtStatus = STATUS_SUCCESS;
+    PEPROCESS pEProcess = NULL;
+    PCHAR pStrProcName = NULL;
 
-				//
-				// The demo denies access to said file.
-				//
-				return STATUS_ACCESS_DENIED;
-			}
+    // 프로세스가 스스로 종료되는 것은 허용한다.
+    if (NtCurrentProcess() == ProcessHandle) 
+        return OrigNtTerminateProcess(ProcessHandle, ExitStatus);
 
-			ExFreePool(ObjectName);
-		}
-	}
+    // 프로세스 핸들로부터 EPROCESS 구조체의 주소를 구한다.
+    rtStatus = ObReferenceObjectByHandle(ProcessHandle, FILE_READ_DATA, NULL, KernelMode, (PVOID*)&pEProcess, NULL);
+    if (!NT_SUCCESS(rtStatus) || pEProcess == NULL)
+        return OrigNtTerminateProcess(ProcessHandle, ExitStatus);
 
-	//
-	// We're uninterested, call the original.
-	//
-	return OriginalNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    // EPROCESS 로부터 프로세스명을 구한다.
+    if (PsGetProcessImageFileName == NULL) {
+        UNICODE_STRING StringPsGetProcessImageFileName = RTL_CONSTANT_STRING(L"PsGetProcessImageFileName");
+        PsGetProcessImageFileName = (PsGetProcessImageFileName_t)MmGetSystemRoutineAddress(&StringPsGetProcessImageFileName);
+    }
+
+    pStrProcName = (PCHAR)PsGetProcessImageFileName(pEProcess);
+    bool block = pStrProcName != NULL && !strcmp(pStrProcName, "notepad.exe");
+
+    // EPROCESS 구조체 참조 해제
+    ObReferenceObject(pEProcess);
+
+    if (block)	// 메모장(notepad.exe)이 종료되는 것을 막는다.
+        return STATUS_SUCCESS;
+
+    // 원본 NtTerminateProcess 호출
+    return OrigNtTerminateProcess(ProcessHandle, ExitStatus);
 }
